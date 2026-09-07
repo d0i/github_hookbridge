@@ -186,36 +186,49 @@ The full GitHub payload should not be forwarded by default. If full payload forw
 
 ## Reliability and duplicate handling
 
-GitHub can retry deliveries. The bridge must use `X-GitHub-Delivery` as an idempotency key.
+The bridge uses SQLite as both a durable delivery queue and the source of truth for idempotency.
 
-Initial implementation options:
+When a valid, policy-approved webhook is received:
 
-1. SQLite-backed delivery table for durable deduplication.
-2. Small local state file only if the service is explicitly best-effort.
-3. In-memory cache is insufficient as the sole mechanism because restarts lose history.
+1. Verify the HMAC signature and payload policy.
+2. Insert the delivery into SQLite with status `pending`.
+3. Return `202 Accepted` immediately, targeting a sub-30ms local processing path.
+4. Let a background goroutine claim and process pending deliveries.
 
-Recommended initial design: SQLite with a bounded retention period, storing only:
+The worker forwards approved summaries to OpenClaw with exponential backoff:
+
+- Retry 1: 5 seconds.
+- Retry 2: 15 seconds.
+- Retry 3: 45 seconds.
+- After the third retry: mark the delivery `failed`.
+
+A duplicate `X-GitHub-Delivery` ID that already exists in SQLite returns:
+
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+```
+
+```json
+{"status":"ignored_duplicate"}
+```
+
+It must not return `409 Conflict`, because that can cause confusing redelivery status in GitHub's delivery log.
+
+The SQLite delivery record should include only bounded operational data:
 
 - Delivery ID.
 - Received timestamp.
 - Event name.
 - Repository.
+- Action.
 - Processing status.
-- Optional error classification.
+- Attempt count.
+- Next-attempt timestamp.
+- Last error classification.
+- Completed/failed timestamp.
 
-Do not store full webhook payloads unless specifically required.
-
-Forwarding behavior must define:
-
-- Connect timeout.
-- Request timeout.
-- Maximum retry count.
-- Backoff strategy.
-- Whether retries can cause duplicate OpenClaw invocations.
-- Whether accepted events survive a process restart.
-
-For the first version, a synchronous forward with short bounded retries may be sufficient. A durable queue can be added if GitHub delivery volume or reliability requirements justify it.
-
+Full GitHub payloads must not be stored or forwarded by default.
 ## Security requirements
 
 - Listen on `127.0.0.1` only.
@@ -239,7 +252,7 @@ GitHub source IP filtering may be considered as defense in depth, but it must no
 
 ## Configuration proposal
 
-The implementation should use environment variables or an `EnvironmentFile` managed by systemd. Proposed names:
+The implementation should use protected secret files, not inline environment values, for credentials. Proposed configuration:
 
 ```text
 GHB_LISTEN_ADDR=127.0.0.1:8003
@@ -247,15 +260,19 @@ GHB_GITHUB_SECRET_FILE=/etc/github-hookbridge/github-webhook-secret
 GHB_OPENCLAW_URL=http://127.0.0.1:8001/hooks/agent
 GHB_OPENCLAW_TOKEN_FILE=/etc/github-hookbridge/openclaw-hooks-token
 GHB_ALLOWED_REPOSITORIES=owner/repository
-GHB_ALLOWED_EVENTS=issues,issue_comment,pull_request
-GHB_ALLOWED_ACTIONS_FILE=/etc/github-hookbridge/actions.json
 GHB_MAX_BODY_BYTES=1048576
 GHB_FORWARD_TIMEOUT=5s
 GHB_DB_PATH=/var/lib/github-hookbridge/deliveries.sqlite3
 GHB_LOG_LEVEL=info
 ```
 
-Secrets should preferably be supplied through protected files rather than inline environment values, because environment values can be exposed by diagnostics or process inspection.
+The event/action policy is fixed in the application configuration and must allow only:
+
+- `issues`: `opened`, `closed`, `reopened`
+- `issue_comment`: `created`
+- `pull_request`: `opened`, `closed`
+
+Secrets must be readable only by the `ghbridge` service user. They must never appear in the URL, source code, checked-in configuration, or ordinary logs.
 
 ## nginx integration plan
 
@@ -288,15 +305,15 @@ The bridge must be running and listening before the nginx route is enabled.
 
 ## systemd integration plan
 
-A user or system service will be added only after the implementation is tested. The service should:
+A system service will be added after the implementation is tested. It will:
 
+- Run as an unprivileged dedicated user named `ghbridge`.
 - Start after networking and OpenClaw.
 - Restart on failure with a bounded restart delay.
-- Use a restricted service user where possible.
 - Have a private writable state directory.
-- Read secrets from protected files.
+- Read secrets from protected files such as `/etc/github-hookbridge/github-webhook-secret` with `0600` permissions.
 - Set a restrictive `UMask`.
-- Use basic systemd hardening appropriate for the chosen deployment.
+- Use basic systemd hardening appropriate for the deployment.
 
 The deployment procedure must include a rollback path for both the systemd unit and nginx configuration.
 
@@ -344,18 +361,86 @@ Go is the recommended implementation language because this service is a small lo
 - Easy systemd integration.
 - Good support for table-driven unit tests.
 
-The first implementation should prefer the Go standard library and a small SQLite dependency only if durable deduplication is included.
+The first implementation should use the pure-Go SQLite driver `modernc.org/sqlite` so the bridge remains a CGO-free static binary. SQLite is required in V1 for durable deduplication and the asynchronous task queue.
 
-## Open decisions before implementation
+## Confirmed design choices
 
-1. Which GitHub events and actions are required initially?
-2. Which repository or repositories are allowed?
-3. Should forwarding be synchronous or queued?
-4. Should duplicate deliveries return `202` or `409`?
-5. Is full payload forwarding required, or is a summarized message sufficient?
-6. Should SQLite deduplication be included in version one?
-7. Which OpenClaw hook endpoint and fixed agent/session policy should be used?
-8. Should the bridge be a user service or a system service?
-9. What retention period is acceptable for delivery IDs and operational logs?
+The following decisions are finalized for the initial implementation.
 
-Implementation should not begin until these choices are confirmed or sensible defaults are explicitly accepted.
+### Target events and actions
+
+- `issues`: `opened`, `closed`, `reopened`
+- `issue_comment`: `created`
+- `pull_request`: `opened`, `closed`
+
+All other events and actions are rejected.
+
+### Allowed repositories
+
+The payload field `repository.full_name` must match an exact allowlist configured through `GHB_ALLOWED_REPOSITORIES`, using values such as `owner/repo`.
+
+### Forwarding architecture
+
+Processing is fully asynchronous. After HMAC verification, policy validation, and insertion into SQLite with status `pending`, the bridge returns `202 Accepted` immediately. A background goroutine processes pending tasks and forwards them to OpenClaw.
+
+Forwarding failures use exponential backoff at 5 seconds, 15 seconds, and 45 seconds, with a maximum of three retries. After the final failure, the delivery is marked `failed`.
+
+### Duplicate deliveries
+
+If a delivery ID already exists in SQLite, the bridge returns `202 Accepted` with:
+
+```json
+{"status":"ignored_duplicate"}
+```
+
+The bridge does not return `409 Conflict` for duplicates.
+
+### Payload formatting
+
+Summary mode is mandatory. Full raw GitHub payloads are never forwarded by default. The bridge emits only bounded structural data:
+
+```json
+{
+  "name": "github",
+  "event": "issues",
+  "deliveryId": "...",
+  "repository": "owner/repository",
+  "action": "opened",
+  "sender": "octocat",
+  "summary": "Issue #123 opened: Example title",
+  "payload": {
+    "number": 123,
+    "url": "https://github.com/owner/repository/issues/123"
+  }
+}
+```
+
+### Storage and dependencies
+
+SQLite is required in V1 for durable deduplication and the asynchronous queue. The implementation will use the pure-Go `modernc.org/sqlite` driver to avoid CGO dependencies and produce a CGO-free static binary.
+
+### OpenClaw upstream
+
+The target endpoint is:
+
+```text
+http://127.0.0.1:8001/hooks/agent
+```
+
+The bridge uses a fixed configured `agentId`, such as `main`, and a dedicated OpenClaw hook token. Payloads cannot select an arbitrary agent or session.
+
+### Service and deployment
+
+The bridge will run as a systemd system service under the unprivileged dedicated user `ghbridge`. Secrets are read strictly from protected files, for example:
+
+```text
+/etc/github-hookbridge/github-webhook-secret
+```
+
+Secret files must have `0600` permissions and be readable only by the service account.
+
+### Retention and maintenance
+
+Delivery history and operational records are retained in SQLite for seven days. The daemon runs a daily cleanup routine. Full webhook payloads are not retained.
+
+Implementation may now proceed against this specification.
