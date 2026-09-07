@@ -1,0 +1,26 @@
+[Unit]
+Description=GitHub Webhook Bridge for OpenClaw
+After=network-online.target openclaw-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghbridge
+Group=ghbridge
+ExecStart=/usr/local/bin/github-hookbridge
+EnvironmentFile=-/etc/default/github-hookbridge
+WorkingDirectory=/var/lib/github-hookbridge
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/github-hookbridge
+ReadWritePaths=/var/lib/github-hookbridge
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

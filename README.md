@@ -6,7 +6,7 @@ The bridge is intended to run locally on the VM. nginx exposes only the exact pu
 
 ## Status
 
-This repository currently contains the design specification only. Implementation is planned in Go.
+Implementation is in progress in Go according to the confirmed design choices at the end of this document.
 
 ## Why a bridge is needed
 
@@ -87,16 +87,13 @@ Accepted request properties:
 
 Response behavior:
 
-- `202 Accepted`: signature and policy accepted; forwarding is queued or completed according to implementation mode
+- `202 Accepted`: signature and policy accepted; the delivery was queued or identified as a duplicate
 - `400 Bad Request`: malformed request, missing required header, invalid JSON, or unsupported content type
 - `401 Unauthorized`: missing or invalid GitHub signature
 - `403 Forbidden`: valid signature but repository/event/action is not allowed
-- `409 Conflict`: duplicate delivery that was already accepted
+- `202 Accepted`: duplicate delivery; response body is `{"status":"ignored_duplicate"}`
 - `413 Content Too Large`: body exceeds configured limit
 - `405 Method Not Allowed`: method is not POST
-- `502 Bad Gateway` or `503 Service Unavailable`: accepted delivery could not be forwarded and no durable queue is available
-
-The exact status policy must be finalized before implementation, particularly whether an already-seen delivery is returned as `202` for GitHub retry friendliness or `409` for observability.
 
 ### `GET /healthz`
 
@@ -127,7 +124,7 @@ The bridge must reject:
 - Signature mismatch.
 - Missing delivery ID or event header.
 
-The GitHub webhook secret must be loaded from an environment variable or root-readable secret file, never from the URL, source code, or a checked-in configuration file.
+The GitHub webhook secret must be loaded from a protected secret file, never from the URL, source code, or a checked-in configuration file.
 
 ## Policy enforcement
 
@@ -363,9 +360,42 @@ Go is the recommended implementation language because this service is a small lo
 
 The first implementation should use the pure-Go SQLite driver `modernc.org/sqlite` so the bridge remains a CGO-free static binary. SQLite is required in V1 for durable deduplication and the asynchronous task queue.
 
+## Repository layout
+
+- `main.go`: HTTP server, GitHub verification, SQLite queue, worker, and OpenClaw forwarding.
+- `main_test.go`: signature, policy, deduplication, and forwarding tests.
+- `deploy/github-hookbridge.service`: systemd system-service template.
+- `deploy/nginx-hooks-github.conf`: exact nginx location for `/hooks/github`.
+
+## Local development
+
+Create protected development secret files and configure at least one allowed repository:
+
+```bash
+mkdir -p /tmp/github-hookbridge-secrets
+umask 077
+printf '%s\n' 'development-github-secret' > /tmp/github-hookbridge-secrets/github
+printf '%s\n' 'development-openclaw-token' > /tmp/github-hookbridge-secrets/openclaw
+
+GHB_GITHUB_SECRET_FILE=/tmp/github-hookbridge-secrets/github \\
+GHB_OPENCLAW_TOKEN_FILE=/tmp/github-hookbridge-secrets/openclaw \\
+GHB_ALLOWED_REPOSITORIES=owner/repo \\
+GHB_DB_PATH=/tmp/github-hookbridge.sqlite3 \\
+go run .
+```
+
+Build and test:
+
+```bash
+go test ./...
+go vet ./...
+go build -trimpath -ldflags='-s -w' -o github-hookbridge .
+```
+
 ## Confirmed design choices
 
 The following decisions are finalized for the initial implementation.
+
 
 ### Target events and actions
 
