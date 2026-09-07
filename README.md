@@ -392,7 +392,31 @@ go vet ./...
 go build -trimpath -ldflags='-s -w' -o github-hookbridge .
 ```
 
-## Confirmed design choices
+### Dry-run mode
+
+For pre-production verification, set `GHB_DRY_RUN=true`. In this mode the bridge:
+
+- Verifies the GitHub HMAC signature.
+- Accepts any valid JSON GitHub event, including `ping`.
+- Records each new delivery ID in SQLite.
+- Appends the complete verified request body as JSONL to `GHB_DRY_RUN_LOG_FILE`.
+- Returns `202 Accepted` with `{"status":"dry_run_logged"}`.
+- Does not start the queue worker and does not make any request to OpenClaw.
+
+The live VM uses `/etc/github-hookbridge/github-webhook-secret` for the GitHub secret and `/var/lib/github-hookbridge/webhooks.jsonl` for the protected dry-run log. The OpenClaw token is intentionally not configured in dry-run mode.
+
+To inspect the secret from the VM console without exposing it in chat:
+
+```bash
+sudo cat /etc/github-hookbridge/github-webhook-secret
+```
+
+To inspect received webhook records:
+
+```bash
+sudo less /var/lib/github-hookbridge/webhooks.jsonl
+```
+
 
 The following decisions are finalized for the initial implementation.
 

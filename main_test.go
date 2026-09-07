@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -94,6 +95,23 @@ func TestWebhookRejectsDisallowedAction(t *testing.T) {
 	}
 }
 
+func TestDryRunAcceptsAndLogsAnySignedEvent(t *testing.T) {
+	bridge := testBridge(t)
+	bridge.cfg.DryRun = true
+	bridge.cfg.DryRunLogFile = filepath.Join(t.TempDir(), "webhooks.jsonl")
+	body := []byte(`{"zen":"Keep it logically awesome.","repository":{"full_name":"owner/repo"}}`)
+	rec := signedRequest(t, bridge, body, "ping-1", "ping")
+	if rec.Code != http.StatusAccepted || !bytes.Contains(rec.Body.Bytes(), []byte("dry_run_logged")) {
+		t.Fatalf("response = %d %s", rec.Code, rec.Body.String())
+	}
+	logged, err := os.ReadFile(bridge.cfg.DryRunLogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(logged, body) {
+		t.Fatalf("body not found in dry-run log: %s", logged)
+	}
+}
 func TestForwardUsesFixedOpenClawSettings(t *testing.T) {
 	var got http.Request
 	var gotBody []byte

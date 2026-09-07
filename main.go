@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,21 +42,28 @@ type Config struct {
 	ForwardTimeout      time.Duration
 	MaxBodyBytes        int64
 	LogLevel            slog.Level
+	DryRun              bool
+	DryRunLogFile       string
 }
 
 func loadConfig() (Config, error) {
 	secretFile := envOr("GHB_GITHUB_SECRET_FILE", "")
-	tokenFile := envOr("GHB_OPENCLAW_TOKEN_FILE", "")
-	if secretFile == "" || tokenFile == "" {
-		return Config{}, errors.New("GHB_GITHUB_SECRET_FILE and GHB_OPENCLAW_TOKEN_FILE are required")
+	if secretFile == "" {
+		return Config{}, errors.New("GHB_GITHUB_SECRET_FILE is required")
 	}
 	secret, err := readSecret(secretFile)
 	if err != nil {
 		return Config{}, fmt.Errorf("read GitHub secret: %w", err)
 	}
-	token, err := readSecret(tokenFile)
-	if err != nil {
-		return Config{}, fmt.Errorf("read OpenClaw token: %w", err)
+	dryRun := strings.EqualFold(envOr("GHB_DRY_RUN", "false"), "true")
+	var token []byte
+	if tokenFile := envOr("GHB_OPENCLAW_TOKEN_FILE", ""); tokenFile != "" {
+		token, err = readSecret(tokenFile)
+		if err != nil {
+			return Config{}, fmt.Errorf("read OpenClaw token: %w", err)
+		}
+	} else if !dryRun {
+		return Config{}, errors.New("GHB_OPENCLAW_TOKEN_FILE is required unless GHB_DRY_RUN=true")
 	}
 	repos := make(map[string]struct{})
 	for _, value := range strings.Split(os.Getenv("GHB_ALLOWED_REPOSITORIES"), ",") {
@@ -64,7 +72,7 @@ func loadConfig() (Config, error) {
 			repos[value] = struct{}{}
 		}
 	}
-	if len(repos) == 0 {
+	if len(repos) == 0 && !dryRun {
 		return Config{}, errors.New("GHB_ALLOWED_REPOSITORIES must contain at least one repository")
 	}
 	maxBytes := maxBodySize
@@ -96,6 +104,8 @@ func loadConfig() (Config, error) {
 		ForwardTimeout:      forwardTimeout,
 		MaxBodyBytes:        maxBytes,
 		LogLevel:            level,
+		DryRun:              dryRun,
+		DryRunLogFile:       envOr("GHB_DRY_RUN_LOG_FILE", "/var/log/github-hookbridge/webhooks.jsonl"),
 	}, nil
 }
 
@@ -133,6 +143,7 @@ type Bridge struct {
 	db     *sql.DB
 	client *http.Client
 	log    *slog.Logger
+	logMu  sync.Mutex
 }
 
 type delivery struct {
@@ -248,6 +259,16 @@ func (b *Bridge) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	if raw == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON object required"})
+		return
+	}
+	if b.cfg.DryRun {
+		status, err := b.recordDryRun(r.Context(), deliveryID, event, raw, body)
+		if err != nil {
+			b.log.Error("dry-run recording failed", "event", event, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record webhook"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
 		return
 	}
 	summary, err := buildSummary(event, deliveryID, raw, b.cfg.AllowedRepositories)
@@ -384,6 +405,55 @@ func truncate(value string, max int) string {
 		return value
 	}
 	return string(runes[:max]) + "…"
+}
+
+func (b *Bridge) recordDryRun(ctx context.Context, id, event string, raw map[string]any, body []byte) (string, error) {
+	now := time.Now().Unix()
+	repository, _ := nestedString(raw, "repository", "full_name")
+	action, _ := rawString(raw, "action")
+	result, err := b.db.ExecContext(ctx, `INSERT INTO deliveries
+		(id,event,repository,action,summary,payload_json,status,attempts,next_attempt_at,created_at,updated_at,completed_at)
+		VALUES(?,?,?,?,?,'{}','completed',0,?,?,?,?)`, id, event, repository, action, "dry-run", now, now, now, now)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return "ignored_duplicate", nil
+		}
+		return "", err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return "", err
+	}
+	if err := b.appendDryRunLog(id, event, body); err != nil {
+		return "", err
+	}
+	return "dry_run_logged", nil
+}
+
+func (b *Bridge) appendDryRunLog(id, event string, body []byte) error {
+	if dir := filepath.Dir(b.cfg.DryRunLogFile); dir != "." {
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return err
+		}
+	}
+	line := struct {
+		ReceivedAt string          `json:"received_at"`
+		DeliveryID string          `json:"delivery_id"`
+		Event      string          `json:"event"`
+		Body       json.RawMessage `json:"body"`
+	}{time.Now().UTC().Format(time.RFC3339Nano), id, event, json.RawMessage(body)}
+	encoded, err := json.Marshal(line)
+	if err != nil {
+		return err
+	}
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
+	file, err := os.OpenFile(b.cfg.DryRunLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(append(encoded, '\n'))
+	return err
 }
 
 func (b *Bridge) enqueue(ctx context.Context, id, event, repo, action, summary string, payload []byte) (string, error) {
@@ -598,14 +668,16 @@ func main() {
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: http.HandlerFunc(bridge.handler), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go bridge.worker(ctx)
+	if !cfg.DryRun {
+		go bridge.worker(ctx)
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
-	logger.Info("github webhook bridge listening", "addr", cfg.ListenAddr, "openclaw_url", cfg.OpenClawURL)
+	logger.Info("github webhook bridge listening", "addr", cfg.ListenAddr, "openclaw_url", cfg.OpenClawURL, "dry_run", cfg.DryRun)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
