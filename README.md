@@ -392,30 +392,91 @@ go vet ./...
 go build -trimpath -ldflags='-s -w' -o github-hookbridge .
 ```
 
-### Dry-run mode
+### GitHub setup and dry-run verification
 
-For pre-production verification, set `GHB_DRY_RUN=true`. In this mode the bridge:
+The current VM deployment runs in dry-run mode. It verifies GitHub signatures and records received webhook bodies, but it does not call OpenClaw.
 
-- Verifies the GitHub HMAC signature.
-- Accepts any valid JSON GitHub event, including `ping`.
-- Records each new delivery ID in SQLite.
-- Appends the complete verified request body as JSONL to `GHB_DRY_RUN_LOG_FILE`.
-- Returns `202 Accepted` with `{"status":"dry_run_logged"}`.
-- Does not start the queue worker and does not make any request to OpenClaw.
+### Configure a repository webhook
 
-The live VM uses `/etc/github-hookbridge/github-webhook-secret` for the GitHub secret and `/var/lib/github-hookbridge/webhooks.jsonl` for the protected dry-run log. The OpenClaw token is intentionally not configured in dry-run mode.
+1. Open the target repository on GitHub.
+2. Go to **Settings** → **Webhooks** → **Add webhook**.
+3. Set **Payload URL** to:
 
-To inspect the secret from the VM console without exposing it in chat:
+   ```text
+   https://doi-agent-home.exe.xyz/hooks/github
+   ```
+
+4. Set **Content type** to `application/json`.
+5. In **Secret**, enter the content of the protected VM file:
+
+   ```text
+   /etc/github-hookbridge/github-webhook-secret
+   ```
+
+   On the VM console, inspect it with:
+
+   ```bash
+   sudo cat /etc/github-hookbridge/github-webhook-secret
+   ```
+
+   Do not paste this secret into chat, Git, the URL, or a shell history file.
+
+6. Leave **Enable SSL verification** enabled.
+7. Select **Let me select individual events** and enable the events currently supported by the production design:
+
+   - Issues
+   - Issue comments
+   - Pull requests
+
+   The dry-run receiver also accepts GitHub's signed `ping` delivery, which GitHub sends when the webhook is created.
+8. Leave **Active** enabled and click **Add webhook**.
+
+GitHub's repository webhook creation flow is documented in [Creating webhooks](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks).
+
+### Confirm delivery in GitHub
+
+After saving the webhook:
+
+1. Open the webhook again from **Settings** → **Webhooks**.
+2. Open **Recent deliveries**.
+3. Click a delivery GUID to inspect the request headers, request payload, timestamp, and response received from the bridge.
+4. A successful dry-run delivery should have an HTTP `202` response and a body similar to:
+
+   ```json
+   {"status":"dry_run_logged"}
+   ```
+
+GitHub keeps recent delivery details for three days. Failed deliveries are not automatically redelivered; an administrator can use **Redeliver** from the delivery details page. See [Redelivering webhooks](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks).
+
+### Inspect logs on the VM
+
+Service lifecycle and error logs:
 
 ```bash
-sudo cat /etc/github-hookbridge/github-webhook-secret
+sudo systemctl status github-hookbridge.service
+sudo journalctl -u github-hookbridge.service -f
 ```
 
-To inspect received webhook records:
+The complete verified request bodies are stored as JSON Lines with mode `0600`:
+
+```text
+/var/lib/github-hookbridge/webhooks.jsonl
+```
+
+Useful commands:
 
 ```bash
-sudo less /var/lib/github-hookbridge/webhooks.jsonl
+# Show the most recent received webhook
+sudo tail -n 1 /var/lib/github-hookbridge/webhooks.jsonl | jq .
+
+# Follow newly received webhook bodies
+sudo tail -f /var/lib/github-hookbridge/webhooks.jsonl | jq .
+
+# Check the file permissions
+sudo stat -c '%A %U:%G %n' /var/lib/github-hookbridge/webhooks.jsonl
 ```
+
+Each log line contains `received_at`, `delivery_id`, `event`, and the complete verified GitHub request body. The log is intended for temporary pre-production inspection and may contain issue, comment, and pull-request text.
 
 
 The following decisions are finalized for the initial implementation.
