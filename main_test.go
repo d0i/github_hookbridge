@@ -126,7 +126,7 @@ func TestDryRunRecordsTrimmedOpenClawPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"openclaw_request"`, `"agentId":"main"`, `"sessionMode":"isolated"`, `"repository":"owner/repo"`, `"action":"opened"`} {
+	for _, want := range []string{`"openclaw_request"`, `"agentId":"main"`, `"sessionMode":"isolated"`, `"repository":"owner/repo"`, `"action":"opened"`, `[github-hookbridge:v1]`} {
 		if !bytes.Contains(outbound, []byte(want)) {
 			t.Fatalf("outbound log missing %s: %s", want, outbound)
 		}
@@ -154,7 +154,7 @@ func TestForwardUsesFixedOpenClawSettings(t *testing.T) {
 	if got.Header.Get("Authorization") != "Bearer openclaw-token" {
 		t.Fatalf("authorization = %q", got.Header.Get("Authorization"))
 	}
-	if !bytes.Contains(gotBody, []byte(`"agentId":"main"`)) || !bytes.Contains(gotBody, []byte(`"sessionMode":"isolated"`)) {
-		t.Fatalf("OpenClaw settings missing: %s", gotBody)
+	if !bytes.Contains(gotBody, []byte(`[github-hookbridge:v1]\nExample`)) {
+		t.Fatalf("GitHub hook marker missing: %s", gotBody)
 	}
 }

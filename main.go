@@ -613,7 +613,7 @@ func (b *Bridge) claim(ctx context.Context) (delivery, bool, error) {
 }
 
 func (b *Bridge) buildOpenClawPayload(summary githubSummary) ([]byte, error) {
-	message := summary.Summary
+	message := "[github-hookbridge:v1]\n" + summary.Summary
 	if summary.Sender != "" {
 		message += " (by " + summary.Sender + ")"
 	}
