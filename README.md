@@ -394,7 +394,7 @@ go build -trimpath -ldflags='-s -w' -o github-hookbridge .
 
 ### GitHub setup and dry-run verification
 
-The current VM deployment runs in dry-run mode. It verifies GitHub signatures and records received webhook bodies, but it does not call OpenClaw.
+The bridge is currently deployed in production mode. It verifies GitHub signatures, applies the repository/event policy, and forwards the trimmed payload to the OpenClaw Gateway. Set `GHB_DRY_RUN=true` only when performing a controlled pre-production inspection; dry-run does not call OpenClaw.
 
 ### Configure a repository webhook
 
@@ -487,7 +487,7 @@ sudo tail -f /var/lib/github-hookbridge/webhooks.jsonl | jq .
 sudo stat -c '%A %U:%G %n' /var/lib/github-hookbridge/webhooks.jsonl
 ```
 
-Each log line contains `received_at`, `delivery_id`, `event`, and the complete verified GitHub request body. The log is intended for temporary pre-production inspection and may contain issue, comment, and pull-request text.
+The JSONL payload files described above are only written when `GHB_DRY_RUN=true`. In production mode, delivery history and retry state are retained in SQLite for seven days; full webhook payloads are not retained.
 
 
 The following decisions are finalized for the initial implementation.
