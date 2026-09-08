@@ -428,7 +428,7 @@ func (b *Bridge) recordDryRun(ctx context.Context, id, event string, raw map[str
 	if err := b.appendDryRunLog(id, event, body); err != nil {
 		return "", err
 	}
-	if summary, summaryErr := buildSummary(event, id, raw, b.cfg.AllowedRepositories); summaryErr == nil {
+	if summary, summaryErr := buildSummary(event, id, raw, dryRunRepositoryAllowlist(raw)); summaryErr == nil {
 		outbound, outboundErr := b.buildOpenClawPayload(summary)
 		if outboundErr != nil {
 			return "", outboundErr
@@ -440,6 +440,13 @@ func (b *Bridge) recordDryRun(ctx context.Context, id, event string, raw map[str
 	return "dry_run_logged", nil
 }
 
+func dryRunRepositoryAllowlist(raw map[string]any) map[string]struct{} {
+	repository, ok := nestedString(raw, "repository", "full_name")
+	if !ok {
+		return nil
+	}
+	return map[string]struct{}{repository: {}}
+}
 func (b *Bridge) appendDryRunLog(id, event string, body []byte) error {
 	if dir := filepath.Dir(b.cfg.DryRunLogFile); dir != "." {
 		if err := os.MkdirAll(dir, 0750); err != nil {
