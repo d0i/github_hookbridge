@@ -32,18 +32,19 @@ const (
 )
 
 type Config struct {
-	ListenAddr          string
-	GitHubSecret        []byte
-	OpenClawURL         string
-	OpenClawToken       string
-	OpenClawAgentID     string
-	AllowedRepositories map[string]struct{}
-	DBPath              string
-	ForwardTimeout      time.Duration
-	MaxBodyBytes        int64
-	LogLevel            slog.Level
-	DryRun              bool
-	DryRunLogFile       string
+	ListenAddr            string
+	GitHubSecret          []byte
+	OpenClawURL           string
+	OpenClawToken         string
+	OpenClawAgentID       string
+	AllowedRepositories   map[string]struct{}
+	DBPath                string
+	ForwardTimeout        time.Duration
+	MaxBodyBytes          int64
+	LogLevel              slog.Level
+	DryRun                bool
+	DryRunLogFile         string
+	DryRunOutboundLogFile string
 }
 
 func loadConfig() (Config, error) {
@@ -94,18 +95,19 @@ func loadConfig() (Config, error) {
 		level = slog.LevelDebug
 	}
 	return Config{
-		ListenAddr:          envOr("GHB_LISTEN_ADDR", "127.0.0.1:8003"),
-		GitHubSecret:        secret,
-		OpenClawURL:         envOr("GHB_OPENCLAW_URL", "http://127.0.0.1:8001/hooks/agent"),
-		OpenClawToken:       string(token),
-		OpenClawAgentID:     envOr("GHB_OPENCLAW_AGENT_ID", "main"),
-		AllowedRepositories: repos,
-		DBPath:              envOr("GHB_DB_PATH", filepath.Join("data", "deliveries.sqlite3")),
-		ForwardTimeout:      forwardTimeout,
-		MaxBodyBytes:        maxBytes,
-		LogLevel:            level,
-		DryRun:              dryRun,
-		DryRunLogFile:       envOr("GHB_DRY_RUN_LOG_FILE", "/var/log/github-hookbridge/webhooks.jsonl"),
+		ListenAddr:            envOr("GHB_LISTEN_ADDR", "127.0.0.1:8003"),
+		GitHubSecret:          secret,
+		OpenClawURL:           envOr("GHB_OPENCLAW_URL", "http://127.0.0.1:8001/hooks/agent"),
+		OpenClawToken:         string(token),
+		OpenClawAgentID:       envOr("GHB_OPENCLAW_AGENT_ID", "main"),
+		AllowedRepositories:   repos,
+		DBPath:                envOr("GHB_DB_PATH", filepath.Join("data", "deliveries.sqlite3")),
+		ForwardTimeout:        forwardTimeout,
+		MaxBodyBytes:          maxBytes,
+		LogLevel:              level,
+		DryRun:                dryRun,
+		DryRunLogFile:         envOr("GHB_DRY_RUN_LOG_FILE", "/var/log/github-hookbridge/webhooks.jsonl"),
+		DryRunOutboundLogFile: envOr("GHB_DRY_RUN_OUTBOUND_LOG_FILE", "/var/log/github-hookbridge/openclaw.jsonl"),
 	}, nil
 }
 
@@ -426,6 +428,15 @@ func (b *Bridge) recordDryRun(ctx context.Context, id, event string, raw map[str
 	if err := b.appendDryRunLog(id, event, body); err != nil {
 		return "", err
 	}
+	if summary, summaryErr := buildSummary(event, id, raw, b.cfg.AllowedRepositories); summaryErr == nil {
+		outbound, outboundErr := b.buildOpenClawPayload(summary)
+		if outboundErr != nil {
+			return "", outboundErr
+		}
+		if err := b.appendDryRunOutboundLog(id, event, outbound); err != nil {
+			return "", err
+		}
+	}
 	return "dry_run_logged", nil
 }
 
@@ -448,6 +459,33 @@ func (b *Bridge) appendDryRunLog(id, event string, body []byte) error {
 	b.logMu.Lock()
 	defer b.logMu.Unlock()
 	file, err := os.OpenFile(b.cfg.DryRunLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(append(encoded, '\n'))
+	return err
+}
+
+func (b *Bridge) appendDryRunOutboundLog(id, event string, body []byte) error {
+	if dir := filepath.Dir(b.cfg.DryRunOutboundLogFile); dir != "." {
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return err
+		}
+	}
+	line := struct {
+		RecordedAt string          `json:"recorded_at"`
+		DeliveryID string          `json:"delivery_id"`
+		Event      string          `json:"event"`
+		Request    json.RawMessage `json:"openclaw_request"`
+	}{time.Now().UTC().Format(time.RFC3339Nano), id, event, json.RawMessage(body)}
+	encoded, err := json.Marshal(line)
+	if err != nil {
+		return err
+	}
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
+	file, err := os.OpenFile(b.cfg.DryRunOutboundLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -567,11 +605,7 @@ func (b *Bridge) claim(ctx context.Context) (delivery, bool, error) {
 	return d, true, nil
 }
 
-func (b *Bridge) forward(ctx context.Context, d delivery) error {
-	var summary githubSummary
-	if err := json.Unmarshal(d.Payload, &summary); err != nil {
-		return fmt.Errorf("decode queued summary: %w", err)
-	}
+func (b *Bridge) buildOpenClawPayload(summary githubSummary) ([]byte, error) {
 	message := summary.Summary
 	if summary.Sender != "" {
 		message += " (by " + summary.Sender + ")"
@@ -581,7 +615,7 @@ func (b *Bridge) forward(ctx context.Context, d delivery) error {
 		"name":           "GitHub",
 		"agentId":        b.cfg.OpenClawAgentID,
 		"sessionMode":    "isolated",
-		"idempotencyKey": d.ID,
+		"idempotencyKey": summary.DeliveryID,
 		"event":          summary.Event,
 		"deliveryId":     summary.DeliveryID,
 		"repository":     summary.Repository,
@@ -590,7 +624,15 @@ func (b *Bridge) forward(ctx context.Context, d delivery) error {
 		"summary":        summary.Summary,
 		"payload":        summary.Payload,
 	}
-	body, err := json.Marshal(request)
+	return json.Marshal(request)
+}
+
+func (b *Bridge) forward(ctx context.Context, d delivery) error {
+	var summary githubSummary
+	if err := json.Unmarshal(d.Payload, &summary); err != nil {
+		return fmt.Errorf("decode queued summary: %w", err)
+	}
+	body, err := b.buildOpenClawPayload(summary)
 	if err != nil {
 		return err
 	}

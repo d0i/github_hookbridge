@@ -112,6 +112,29 @@ func TestDryRunAcceptsAndLogsAnySignedEvent(t *testing.T) {
 		t.Fatalf("body not found in dry-run log: %s", logged)
 	}
 }
+func TestDryRunRecordsTrimmedOpenClawPayload(t *testing.T) {
+	bridge := testBridge(t)
+	bridge.cfg.DryRun = true
+	bridge.cfg.DryRunLogFile = filepath.Join(t.TempDir(), "webhooks.jsonl")
+	bridge.cfg.DryRunOutboundLogFile = filepath.Join(t.TempDir(), "openclaw.jsonl")
+	body := []byte(`{"action":"opened","number":123,"repository":{"full_name":"owner/repo"},"sender":{"login":"octocat"},"issue":{"number":123,"title":"Example","html_url":"https://github.com/owner/repo/issues/123"}}`)
+	rec := signedRequest(t, bridge, body, "issues-1", "issues")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("response = %d %s", rec.Code, rec.Body.String())
+	}
+	outbound, err := os.ReadFile(bridge.cfg.DryRunOutboundLogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"openclaw_request"`, `"agentId":"main"`, `"sessionMode":"isolated"`, `"repository":"owner/repo"`, `"action":"opened"`} {
+		if !bytes.Contains(outbound, []byte(want)) {
+			t.Fatalf("outbound log missing %s: %s", want, outbound)
+		}
+	}
+	if bytes.Contains(outbound, []byte(`"issue"`)) {
+		t.Fatal("outbound log contains raw issue payload")
+	}
+}
 func TestForwardUsesFixedOpenClawSettings(t *testing.T) {
 	var got http.Request
 	var gotBody []byte

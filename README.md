@@ -463,11 +463,22 @@ The complete verified request bodies are stored as JSON Lines with mode `0600`:
 /var/lib/github-hookbridge/webhooks.jsonl
 ```
 
+For supported production events, the exact trimmed JSON request that would be sent to OpenClaw is stored separately:
+
+```text
+/var/lib/github-hookbridge/openclaw.jsonl
+```
+
+Dry-run mode never sends this recorded request to OpenClaw.
+
 Useful commands:
 
 ```bash
 # Show the most recent received webhook
 sudo tail -n 1 /var/lib/github-hookbridge/webhooks.jsonl | jq .
+
+# Show the most recent trimmed OpenClaw request
+sudo tail -n 1 /var/lib/github-hookbridge/openclaw.jsonl | jq .
 
 # Follow newly received webhook bodies
 sudo tail -f /var/lib/github-hookbridge/webhooks.jsonl | jq .
