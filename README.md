@@ -58,7 +58,7 @@ The worker checks due windows every `GHB_WORKER_POLL_INTERVAL` (250ms by default
 
 `GHB_FORWARD_TIMEOUT` (25s by default) limits the bridge's HTTP request to OpenClaw. It covers admission of the hook request, **not the model's full run time**; the bridge does not wait for agent completion. Known pre-admission failures (dial/DNS or non-2xx admission responses) use `GHB_RETRY_DELAYS` (5s, 15s, 45s; initial attempt plus three retries). A transport failure whose result is ambiguous, or a bridge restart while a job is in flight, marks the job `uncertain` and suppresses automatic replay. Check OpenClaw before manually requeueing an uncertain job.
 
-The SQLite driver's busy timeout is fixed at 5s, the graceful HTTP shutdown deadline is fixed at 10s, and receipt/quarantine cleanup runs hourly. Receipts and quarantine intervals expire after `GHB_RECEIPT_RETENTION` (168h); sent/failed outbox rows use the same retention. `uncertain` rows are retained for operator review.
+The configured model-run/turn timeout belongs to OpenClaw, not this bridge. The SQLite driver's busy timeout is fixed at 5s, the graceful HTTP shutdown deadline is fixed at 10s, systemd restarts a failed bridge after 5s, and receipt/quarantine cleanup runs hourly. Receipts and quarantine intervals expire after `GHB_RECEIPT_RETENTION` (168h); sent/failed outbox rows use the same retention. `uncertain` rows are retained for operator review.
 
 ## Webhook response behavior
 
