@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -26,11 +27,13 @@ import (
 )
 
 const (
-	maxAttempts     = 4 // initial attempt plus three retries
-	maxBodySize     = int64(1 << 20)
-	retention       = 7 * 24 * time.Hour
-	maxCommentRunes = 4000
-	maxLabelRunes   = 100
+	bridgeVersion       = "2.0.0"
+	defaultQuietWindow  = 10 * time.Second
+	defaultStormWindow  = 60 * time.Second
+	defaultQuarantine   = 600 * time.Second
+	defaultPollInterval = 250 * time.Millisecond
+	defaultForwardLimit = 25 * time.Second
+	defaultMaxBody      = int64(1 << 20)
 )
 
 type Config struct {
@@ -39,14 +42,23 @@ type Config struct {
 	OpenClawURL           string
 	OpenClawToken         string
 	OpenClawAgentID       string
-	AllowedRepositories   map[string]struct{}
+	AllowedRepositories   map[string]string // lowercase full name -> configured spelling
+	IgnoredSenders        map[string]struct{}
 	DBPath                string
+	QuietWindow           time.Duration
+	StormWindow           time.Duration
+	QuarantineDuration    time.Duration
+	WorkerPollInterval    time.Duration
 	ForwardTimeout        time.Duration
+	RetryDelays           []time.Duration
+	ReceiptRetention      time.Duration
 	MaxBodyBytes          int64
+	HTTPReadHeaderTimeout time.Duration
+	HTTPReadTimeout       time.Duration
+	HTTPWriteTimeout      time.Duration
+	HTTPIdleTimeout       time.Duration
 	LogLevel              slog.Level
 	DryRun                bool
-	DryRunLogFile         string
-	DryRunOutboundLogFile string
 }
 
 func loadConfig() (Config, error) {
@@ -58,6 +70,7 @@ func loadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read GitHub secret: %w", err)
 	}
+
 	dryRun := strings.EqualFold(envOr("GHB_DRY_RUN", "false"), "true")
 	var token []byte
 	if tokenFile := envOr("GHB_OPENCLAW_TOKEN_FILE", ""); tokenFile != "" {
@@ -68,30 +81,78 @@ func loadConfig() (Config, error) {
 	} else if !dryRun {
 		return Config{}, errors.New("GHB_OPENCLAW_TOKEN_FILE is required unless GHB_DRY_RUN=true")
 	}
-	repos := make(map[string]struct{})
+
+	repos := make(map[string]string)
 	for _, value := range strings.Split(os.Getenv("GHB_ALLOWED_REPOSITORIES"), ",") {
 		value = strings.TrimSpace(value)
-		if value != "" {
-			repos[value] = struct{}{}
+		if value == "" {
+			continue
 		}
+		if !validRepository(value) {
+			return Config{}, fmt.Errorf("invalid repository in GHB_ALLOWED_REPOSITORIES: %q", value)
+		}
+		repos[strings.ToLower(value)] = value
 	}
 	if len(repos) == 0 && !dryRun {
-		return Config{}, errors.New("GHB_ALLOWED_REPOSITORIES must contain at least one repository")
+		return Config{}, errors.New("GHB_ALLOWED_REPOSITORIES must contain at least one owner/repository")
 	}
-	maxBytes := maxBodySize
+
+	quiet, err := durationEnv("GHB_QUIET_WINDOW", defaultQuietWindow)
+	if err != nil {
+		return Config{}, err
+	}
+	storm, err := durationEnv("GHB_STORM_WINDOW", defaultStormWindow)
+	if err != nil {
+		return Config{}, err
+	}
+	quarantine, err := durationEnv("GHB_QUARANTINE_DURATION", defaultQuarantine)
+	if err != nil {
+		return Config{}, err
+	}
+	if storm <= quiet {
+		return Config{}, errors.New("GHB_STORM_WINDOW must be longer than GHB_QUIET_WINDOW")
+	}
+	poll, err := durationEnv("GHB_WORKER_POLL_INTERVAL", defaultPollInterval)
+	if err != nil {
+		return Config{}, err
+	}
+	forwardTimeout, err := durationEnv("GHB_FORWARD_TIMEOUT", defaultForwardLimit)
+	if err != nil {
+		return Config{}, err
+	}
+	retries, err := retryDelaysEnv("GHB_RETRY_DELAYS", []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second})
+	if err != nil {
+		return Config{}, err
+	}
+	retention, err := durationEnv("GHB_RECEIPT_RETENTION", 7*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	maxBytes := defaultMaxBody
 	if value := os.Getenv("GHB_MAX_BODY_BYTES"); value != "" {
-		maxBytes, err = strconv.ParseInt(value, 10, 64)
+		maxBytes, err = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 		if err != nil || maxBytes < 1 {
 			return Config{}, errors.New("GHB_MAX_BODY_BYTES must be a positive integer")
 		}
 	}
-	forwardTimeout := 5 * time.Second
-	if value := os.Getenv("GHB_FORWARD_TIMEOUT"); value != "" {
-		forwardTimeout, err = time.ParseDuration(value)
-		if err != nil || forwardTimeout <= 0 {
-			return Config{}, errors.New("GHB_FORWARD_TIMEOUT must be a positive duration")
-		}
+
+	readHeaderTimeout, err := durationEnv("GHB_HTTP_READ_HEADER_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return Config{}, err
 	}
+	readTimeout, err := durationEnv("GHB_HTTP_READ_TIMEOUT", 15*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	writeTimeout, err := durationEnv("GHB_HTTP_WRITE_TIMEOUT", 15*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	idleTimeout, err := durationEnv("GHB_HTTP_IDLE_TIMEOUT", 60*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+
 	level := slog.LevelInfo
 	if strings.EqualFold(os.Getenv("GHB_LOG_LEVEL"), "debug") {
 		level = slog.LevelDebug
@@ -103,14 +164,66 @@ func loadConfig() (Config, error) {
 		OpenClawToken:         string(token),
 		OpenClawAgentID:       envOr("GHB_OPENCLAW_AGENT_ID", "main"),
 		AllowedRepositories:   repos,
-		DBPath:                envOr("GHB_DB_PATH", filepath.Join("data", "deliveries.sqlite3")),
+		IgnoredSenders:        ignoredSendersFromEnv(),
+		DBPath:                envOr("GHB_DB_PATH", filepath.Join("data", "deliveries-v2.sqlite3")),
+		QuietWindow:           quiet,
+		StormWindow:           storm,
+		QuarantineDuration:    quarantine,
+		WorkerPollInterval:    poll,
 		ForwardTimeout:        forwardTimeout,
+		RetryDelays:           retries,
+		ReceiptRetention:      retention,
 		MaxBodyBytes:          maxBytes,
+		HTTPReadHeaderTimeout: readHeaderTimeout,
+		HTTPReadTimeout:       readTimeout,
+		HTTPWriteTimeout:      writeTimeout,
+		HTTPIdleTimeout:       idleTimeout,
 		LogLevel:              level,
 		DryRun:                dryRun,
-		DryRunLogFile:         envOr("GHB_DRY_RUN_LOG_FILE", "/var/log/github-hookbridge/webhooks.jsonl"),
-		DryRunOutboundLogFile: envOr("GHB_DRY_RUN_OUTBOUND_LOG_FILE", "/var/log/github-hookbridge/openclaw.jsonl"),
 	}, nil
+}
+
+func ignoredSendersFromEnv() map[string]struct{} {
+	value, configured := os.LookupEnv("GHB_IGNORED_SENDERS")
+	if !configured {
+		value = "d0i-agent"
+	}
+	ignored := make(map[string]struct{})
+	for _, login := range strings.Split(value, ",") {
+		login = normalizeLogin(login)
+		if login != "" {
+			ignored[login] = struct{}{}
+		}
+	}
+	return ignored
+}
+
+func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < time.Millisecond {
+		return 0, fmt.Errorf("%s must be a duration of at least 1ms", key)
+	}
+	return duration, nil
+}
+
+func retryDelaysEnv(key string, fallback []time.Duration) ([]time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	var delays []time.Duration
+	for _, item := range strings.Split(value, ",") {
+		delay, err := time.ParseDuration(strings.TrimSpace(item))
+		if err != nil || delay < time.Millisecond {
+			return nil, fmt.Errorf("%s must be comma-separated positive durations", key)
+		}
+		delays = append(delays, delay)
+	}
+	return delays, nil
 }
 
 func readSecret(path string) ([]byte, error) {
@@ -142,66 +255,65 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func normalizeLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(login), "@")))
+}
+
+func validRepository(repository string) bool {
+	parts := strings.Split(repository, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || len(part) > 100 {
+			return false
+		}
+		for _, r := range part {
+			if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
+				!(r >= '0' && r <= '9') && r != '-' && r != '_' && r != '.' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isIgnoredSender(ignored map[string]struct{}, login string) bool {
+	_, ok := ignored[normalizeLogin(login)]
+	return ok
+}
+
 type Bridge struct {
 	cfg    Config
 	db     *sql.DB
 	client *http.Client
 	log    *slog.Logger
-	logMu  sync.Mutex
+	// Linearizes accepted webhook events against quiet/storm timer transitions.
+	issueStateMu sync.Mutex
 }
 
-type delivery struct {
-	ID         string
-	Event      string
-	Repository string
-	Action     string
-	Summary    string
-	Payload    []byte
-	Attempts   int
+type webhookPayload struct {
+	Action     string `json:"action"`
+	Repository struct {
+		FullName string `json:"full_name"`
+	} `json:"repository"`
+	Issue struct {
+		Number      int64           `json:"number"`
+		PullRequest json.RawMessage `json:"pull_request"`
+	} `json:"issue"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
 }
 
-func openDB(path string) (*sql.DB, error) {
-	if dir := filepath.Dir(path); dir != "." {
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			return nil, err
-		}
-	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	for _, statement := range []string{
-		`PRAGMA busy_timeout = 5000`,
-		`PRAGMA journal_mode = WAL`,
-		`CREATE TABLE IF NOT EXISTS deliveries (
-			id TEXT PRIMARY KEY,
-			event TEXT NOT NULL,
-			repository TEXT NOT NULL,
-			action TEXT NOT NULL,
-			summary TEXT NOT NULL,
-			payload_json TEXT NOT NULL,
-			status TEXT NOT NULL CHECK(status IN ('pending','processing','completed','failed')),
-			attempts INTEGER NOT NULL DEFAULT 0,
-			next_attempt_at INTEGER NOT NULL,
-			last_error TEXT NOT NULL DEFAULT '',
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL,
-			completed_at INTEGER
-		)`,
-		`CREATE INDEX IF NOT EXISTS deliveries_queue_idx ON deliveries(status, next_attempt_at)`,
-		`CREATE INDEX IF NOT EXISTS deliveries_created_idx ON deliveries(created_at)`,
-	} {
-		if _, err := db.Exec(statement); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if _, err := db.Exec(`UPDATE deliveries SET status='pending', updated_at=? WHERE status='processing'`, time.Now().Unix()); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
+type issueEvent struct {
+	DeliveryID  string
+	IssueKey    string
+	Repository  string
+	IssueNumber int64
+	EventName   string
+	ReceivedAt  time.Time
+	AcceptedAt  time.Time
 }
 
 func (b *Bridge) handler(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +322,7 @@ func (b *Bridge) handler(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": bridgeVersion})
 		return
 	}
 	if r.URL.Path == "/readyz" {
@@ -252,470 +364,149 @@ func (b *Bridge) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
 	event := strings.TrimSpace(r.Header.Get("X-GitHub-Event"))
-	if deliveryID == "" || event == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing delivery or event header"})
+	if deliveryID == "" || len(deliveryID) > 200 || event == "" || len(event) > 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing or invalid delivery/event header"})
 		return
 	}
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	if raw == nil {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON object required"})
 		return
 	}
-	if b.cfg.DryRun {
-		status, err := b.recordDryRun(r.Context(), deliveryID, event, raw, body)
+
+	now := time.Now().UTC()
+	if event == "ping" {
+		status, err := b.recordReceiptOnly(r.Context(), deliveryID, "", "", "ping", "ignored_event", now)
 		if err != nil {
-			b.log.Error("dry-run recording failed", "event", event, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record webhook"})
+			b.log.Error("record ping receipt failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record delivery"})
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
 		return
 	}
-	if event == "ping" {
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored_event"})
-		return
-	}
-	summary, err := buildSummary(event, deliveryID, raw, b.cfg.AllowedRepositories)
-	if err != nil {
-		var policyErr *policyError
-		if errors.As(err, &policyErr) {
-			if policyErr.ignore {
-				writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored_policy"})
-				return
-			}
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": policyErr.Error()})
+	if event != "issues" && event != "issue_comment" {
+		status, err := b.recordReceiptOnly(r.Context(), deliveryID, "", "", "ignored_event", "ignored_event", now)
+		if err != nil {
+			b.log.Error("record ignored event failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record delivery"})
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
 		return
 	}
-	payloadJSON, err := json.Marshal(summary)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot encode summary"})
+
+	var payload webhookPayload
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid GitHub event payload"})
 		return
 	}
-	status, err := b.enqueue(r.Context(), deliveryID, event, summary.Repository, summary.Action, summary.Summary, payloadJSON)
+	repoInput := strings.TrimSpace(payload.Repository.FullName)
+	repository, allowed := b.cfg.AllowedRepositories[strings.ToLower(repoInput)]
+	if !allowed {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository is not allowed"})
+		return
+	}
+	if payload.Issue.Number < 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "payload issue.number is required"})
+		return
+	}
+	if payload.Sender.Login == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "payload sender.login is required"})
+		return
+	}
+	if isPullRequestIssue(payload.Issue.PullRequest) {
+		status, err := b.recordReceiptOnly(r.Context(), deliveryID, repository, issueKey(repository, payload.Issue.Number), "ignored_pull_request", "ignored_pull_request", now)
+		if err != nil {
+			b.log.Error("record ignored pull request event failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record delivery"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
+		return
+	}
+
+	action := strings.TrimSpace(payload.Action)
+	if !isAllowedAction(event, action) {
+		status, err := b.recordReceiptOnly(r.Context(), deliveryID, repository, issueKey(repository, payload.Issue.Number), "ignored_action", "ignored_action", now)
+		if err != nil {
+			b.log.Error("record ignored action failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record delivery"})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
+		return
+	}
+
+	key := issueKey(repository, payload.Issue.Number)
+	eventName := event + "." + action
+	if isIgnoredSender(b.cfg.IgnoredSenders, payload.Sender.Login) {
+		status, err := b.recordReceiptOnly(r.Context(), deliveryID, repository, key, eventName, "ignored_sender", now)
+		if err != nil {
+			b.log.Error("record ignored sender event failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot record delivery"})
+			return
+		}
+		if status != "ignored_duplicate" {
+			b.log.Info("automation sender event ignored", "issue_key", key, "event", eventName)
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
+		return
+	}
+
+	status, err := b.recordIssueEventLive(r.Context(), issueEvent{
+		DeliveryID: deliveryID, IssueKey: key, Repository: repository,
+		IssueNumber: payload.Issue.Number, EventName: eventName, ReceivedAt: now,
+	})
 	if err != nil {
-		b.log.Error("enqueue delivery failed", "event", event, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot queue delivery"})
+		b.log.Error("record issue event failed", "issue_key", key, "event", eventName, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot queue issue event"})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
 }
 
-type policyError struct {
-	message string
-	ignore  bool
+func isPullRequestIssue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
-func (e *policyError) Error() string { return e.message }
-
-var allowedActions = map[string]map[string]struct{}{
-	"issues":        {"opened": {}, "closed": {}, "reopened": {}, "labeled": {}, "unlabeled": {}},
-	"issue_comment": {"created": {}},
-	"pull_request":  {"opened": {}, "closed": {}},
+func isAllowedAction(event, action string) bool {
+	switch event {
+	case "issues":
+		switch action {
+		case "opened", "closed", "reopened", "labeled", "unlabeled":
+			return true
+		}
+	case "issue_comment":
+		return action == "created"
+	}
+	return false
 }
 
-type githubSummary struct {
-	Name       string         `json:"name"`
-	Event      string         `json:"event"`
-	DeliveryID string         `json:"deliveryId"`
-	Repository string         `json:"repository"`
-	Action     string         `json:"action"`
-	Sender     string         `json:"sender"`
-	Summary    string         `json:"summary"`
-	Payload    map[string]any `json:"payload"`
+func issueKey(repository string, number int64) string {
+	return strings.ToLower(repository) + "#" + strconv.FormatInt(number, 10)
 }
 
-func buildSummary(event, deliveryID string, raw map[string]any, repos map[string]struct{}) (githubSummary, error) {
-	actions, ok := allowedActions[event]
-	if !ok {
-		return githubSummary{}, &policyError{message: fmt.Sprintf("event %q is not allowed", event), ignore: true}
-	}
-	action, ok := rawString(raw, "action")
-	if !ok {
-		return githubSummary{}, errors.New("payload action is required")
-	}
-	if _, ok := actions[action]; !ok {
-		return githubSummary{}, &policyError{
-			message: fmt.Sprintf("action %q is not allowed for event %q", action, event),
-			ignore:  true,
-		}
-	}
-	repository, ok := nestedString(raw, "repository", "full_name")
-	if !ok {
-		return githubSummary{}, errors.New("payload repository.full_name is required")
-	}
-	if _, ok := repos[repository]; !ok {
-		return githubSummary{}, &policyError{message: fmt.Sprintf("repository %q is not allowed", repository)}
-	}
-	if event == "issue_comment" {
-		issue, ok := raw["issue"].(map[string]any)
-		if !ok {
-			return githubSummary{}, errors.New("payload issue is required")
-		}
-		if _, isPullRequest := issue["pull_request"]; isPullRequest {
-			return githubSummary{}, &policyError{message: "pull request comments are not allowed", ignore: true}
-		}
-	}
-	sender, _ := nestedString(raw, "sender", "login")
-	item := map[string]any{}
-	if number, ok := raw["number"]; ok {
-		item["number"] = number
-	}
-	if url, ok := rawString(raw, "html_url"); ok {
-		item["url"] = url
-	}
-	title := ""
-	if issue, ok := raw["issue"].(map[string]any); ok {
-		if title, ok = rawString(issue, "title"); !ok {
-			title = ""
-		}
-		copyItemFields(item, issue)
-	}
-	if pr, ok := raw["pull_request"].(map[string]any); ok {
-		if title == "" {
-			title, _ = rawString(pr, "title")
-		}
-		copyItemFields(item, pr)
-	}
-	if comment, ok := raw["comment"].(map[string]any); ok {
-		copyItemFields(item, comment)
-	}
-	if title == "" {
-		title, _ = rawString(raw, "title")
-	}
-	if title != "" {
-		item["title"] = truncate(title, 200)
-	}
-	summaryText := fmt.Sprintf("GitHub %s #%v %s in %s", event, item["number"], action, repository)
-	if title != "" {
-		summaryText = fmt.Sprintf("GitHub %s #%v %s: %s", event, item["number"], action, truncate(title, 200))
-	}
-	switch {
-	case event == "issues" && (action == "labeled" || action == "unlabeled"):
-		label, ok := nestedString(raw, "label", "name")
-		if !ok {
-			return githubSummary{}, errors.New("payload label.name is required")
-		}
-		label = truncate(label, maxLabelRunes)
-		item["label"] = label
-		if action == "labeled" {
-			summaryText += fmt.Sprintf("\nLabel added: %s", label)
-		} else {
-			summaryText += fmt.Sprintf("\nLabel removed: %s", label)
-		}
-	case event == "issue_comment":
-		comment, ok := raw["comment"].(map[string]any)
-		if !ok {
-			return githubSummary{}, errors.New("payload comment is required")
-		}
-		body, ok := comment["body"].(string)
-		if !ok {
-			return githubSummary{}, errors.New("payload comment.body is required")
-		}
-		body = truncate(body, maxCommentRunes)
-		item["comment"] = body
-		if body != "" {
-			summaryText += "\nComment (untrusted content): " + body
-		}
-	}
-	return githubSummary{
-		Name: "github", Event: event, DeliveryID: deliveryID, Repository: repository,
-		Action: action, Sender: truncate(sender, 100), Summary: summaryText, Payload: item,
-	}, nil
+func canonicalIssueURL(repository string, number int64) string {
+	return "https://github.com/" + repository + "/issues/" + strconv.FormatInt(number, 10)
 }
 
-func copyItemFields(dst map[string]any, src map[string]any) {
-	for _, key := range []string{"number", "html_url", "url"} {
-		if value, ok := src[key]; ok {
-			if key == "html_url" {
-				dst["url"] = value
-			} else {
-				dst[key] = value
-			}
-		}
-	}
-}
-
-func rawString(m map[string]any, key string) (string, bool) {
-	value, ok := m[key].(string)
-	return strings.TrimSpace(value), ok && strings.TrimSpace(value) != ""
-}
-func nestedString(m map[string]any, keys ...string) (string, bool) {
-	current := m
-	for _, key := range keys[:len(keys)-1] {
-		next, ok := current[key].(map[string]any)
-		if !ok {
-			return "", false
-		}
-		current = next
-	}
-	return rawString(current, keys[len(keys)-1])
-}
-func truncate(value string, max int) string {
-	runes := []rune(value)
-	if len(runes) <= max {
-		return value
-	}
-	return string(runes[:max-1]) + "…"
-}
-
-func (b *Bridge) recordDryRun(ctx context.Context, id, event string, raw map[string]any, body []byte) (string, error) {
-	now := time.Now().Unix()
-	repository, _ := nestedString(raw, "repository", "full_name")
-	action, _ := rawString(raw, "action")
-	result, err := b.db.ExecContext(ctx, `INSERT INTO deliveries
-		(id,event,repository,action,summary,payload_json,status,attempts,next_attempt_at,created_at,updated_at,completed_at)
-		VALUES(?,?,?,?,?,'{}','completed',0,?,?,?,?)`, id, event, repository, action, "dry-run", now, now, now, now)
+func (b *Bridge) recordReceiptOnly(ctx context.Context, id, repository, key, event, outcome string, received time.Time) (string, error) {
+	result, err := b.db.ExecContext(ctx, `INSERT OR IGNORE INTO delivery_receipts
+		(delivery_id,received_at_ms,repository,issue_key,event_name,outcome)
+		VALUES(?,?,?,?,?,?)`, id, received.UnixMilli(), repository, key, event, outcome)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
-			return "ignored_duplicate", nil
-		}
 		return "", err
 	}
-	if count, err := result.RowsAffected(); err != nil || count != 1 {
+	count, err := result.RowsAffected()
+	if err != nil {
 		return "", err
 	}
-	if err := b.appendDryRunLog(id, event, body); err != nil {
-		return "", err
-	}
-	if summary, summaryErr := buildSummary(event, id, raw, dryRunRepositoryAllowlist(raw)); summaryErr == nil {
-		outbound, outboundErr := b.buildOpenClawPayload(summary)
-		if outboundErr != nil {
-			return "", outboundErr
-		}
-		if err := b.appendDryRunOutboundLog(id, event, outbound); err != nil {
-			return "", err
-		}
-	}
-	return "dry_run_logged", nil
-}
-
-func dryRunRepositoryAllowlist(raw map[string]any) map[string]struct{} {
-	repository, ok := nestedString(raw, "repository", "full_name")
-	if !ok {
-		return nil
-	}
-	return map[string]struct{}{repository: {}}
-}
-func (b *Bridge) appendDryRunLog(id, event string, body []byte) error {
-	if dir := filepath.Dir(b.cfg.DryRunLogFile); dir != "." {
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			return err
-		}
-	}
-	line := struct {
-		ReceivedAt string          `json:"received_at"`
-		DeliveryID string          `json:"delivery_id"`
-		Event      string          `json:"event"`
-		Body       json.RawMessage `json:"body"`
-	}{time.Now().UTC().Format(time.RFC3339Nano), id, event, json.RawMessage(body)}
-	encoded, err := json.Marshal(line)
-	if err != nil {
-		return err
-	}
-	b.logMu.Lock()
-	defer b.logMu.Unlock()
-	file, err := os.OpenFile(b.cfg.DryRunLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = file.Write(append(encoded, '\n'))
-	return err
-}
-
-func (b *Bridge) appendDryRunOutboundLog(id, event string, body []byte) error {
-	if dir := filepath.Dir(b.cfg.DryRunOutboundLogFile); dir != "." {
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			return err
-		}
-	}
-	line := struct {
-		RecordedAt string          `json:"recorded_at"`
-		DeliveryID string          `json:"delivery_id"`
-		Event      string          `json:"event"`
-		Request    json.RawMessage `json:"openclaw_request"`
-	}{time.Now().UTC().Format(time.RFC3339Nano), id, event, json.RawMessage(body)}
-	encoded, err := json.Marshal(line)
-	if err != nil {
-		return err
-	}
-	b.logMu.Lock()
-	defer b.logMu.Unlock()
-	file, err := os.OpenFile(b.cfg.DryRunOutboundLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = file.Write(append(encoded, '\n'))
-	return err
-}
-
-func (b *Bridge) enqueue(ctx context.Context, id, event, repo, action, summary string, payload []byte) (string, error) {
-	now := time.Now().Unix()
-	result, err := b.db.ExecContext(ctx, `INSERT INTO deliveries
-		(id,event,repository,action,summary,payload_json,status,attempts,next_attempt_at,created_at,updated_at)
-		VALUES(?,?,?,?,? ,?,'pending',0,?,?,?)`, id, event, repo, action, summary, string(payload), now, now, now)
-	if err == nil {
-		if _, err := result.RowsAffected(); err != nil {
-			return "", err
-		}
-		return "queued", nil
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "constraint") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+	if count == 0 {
 		return "ignored_duplicate", nil
 	}
-	return "", err
-}
-
-func (b *Bridge) worker(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	cleanupTicker := time.NewTicker(24 * time.Hour)
-	defer cleanupTicker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			for i := 0; i < 20; i++ {
-				if err := b.processOne(ctx); err != nil {
-					b.log.Error("worker error", "error", err)
-					break
-				}
-			}
-		case <-cleanupTicker.C:
-			if err := b.cleanup(ctx); err != nil {
-				b.log.Error("cleanup error", "error", err)
-			}
-		}
-	}
-}
-
-func (b *Bridge) cleanup(ctx context.Context) error {
-	cutoff := time.Now().Add(-retention).Unix()
-	result, err := b.db.ExecContext(ctx, `DELETE FROM deliveries WHERE created_at < ?`, cutoff)
-	if err != nil {
-		return err
-	}
-	if count, err := result.RowsAffected(); err == nil && count > 0 {
-		b.log.Info("old deliveries cleaned up", "count", count)
-	}
-	return nil
-}
-
-func (b *Bridge) processOne(ctx context.Context) error {
-	d, ok, err := b.claim(ctx)
-	if err != nil || !ok {
-		return err
-	}
-	requestCtx, cancel := context.WithTimeout(ctx, b.cfg.ForwardTimeout)
-	err = b.forward(requestCtx, d)
-	cancel()
-	if err == nil {
-		_, err = b.db.ExecContext(ctx, `UPDATE deliveries SET status='completed', completed_at=?, updated_at=? WHERE id=?`, time.Now().Unix(), time.Now().Unix(), d.ID)
-		return err
-	}
-	if d.Attempts >= maxAttempts {
-		_, updateErr := b.db.ExecContext(ctx, `UPDATE deliveries SET status='failed', last_error=?, updated_at=? WHERE id=?`, truncate(err.Error(), 500), time.Now().Unix(), d.ID)
-		if updateErr != nil {
-			return updateErr
-		}
-		b.log.Error("delivery failed permanently", "delivery_id", d.ID, "error", err)
-		return nil
-	}
-	backoff := []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}[d.Attempts-1]
-	_, updateErr := b.db.ExecContext(ctx, `UPDATE deliveries SET status='failed', last_error=?, next_attempt_at=?, updated_at=? WHERE id=?`, truncate(err.Error(), 500), time.Now().Add(backoff).Unix(), time.Now().Unix(), d.ID)
-	return updateErr
-}
-
-func (b *Bridge) claim(ctx context.Context) (delivery, bool, error) {
-	tx, err := b.db.BeginTx(ctx, nil)
-	if err != nil {
-		return delivery{}, false, err
-	}
-	defer tx.Rollback()
-	var d delivery
-	var payload string
-	err = tx.QueryRowContext(ctx, `SELECT id,event,repository,action,summary,payload_json,attempts
-		FROM deliveries
-		WHERE (status='pending' OR (status='failed' AND attempts < ?)) AND next_attempt_at<=?
-		ORDER BY next_attempt_at,created_at LIMIT 1`, maxAttempts, time.Now().Unix()).Scan(&d.ID, &d.Event, &d.Repository, &d.Action, &d.Summary, &payload, &d.Attempts)
-	if errors.Is(err, sql.ErrNoRows) {
-		return delivery{}, false, nil
-	}
-	if err != nil {
-		return delivery{}, false, err
-	}
-	d.Payload = []byte(payload)
-	d.Attempts++
-	result, err := tx.ExecContext(ctx, `UPDATE deliveries SET status='processing', attempts=?, updated_at=? WHERE id=? AND status IN ('pending','failed')`, d.Attempts, time.Now().Unix(), d.ID)
-	if err != nil {
-		return delivery{}, false, err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return delivery{}, false, nil
-	}
-	if err := tx.Commit(); err != nil {
-		return delivery{}, false, err
-	}
-	return d, true, nil
-}
-
-func (b *Bridge) buildOpenClawPayload(summary githubSummary) ([]byte, error) {
-	message := "[github-hookbridge:v1]\n" + summary.Summary
-	if summary.Sender != "" {
-		message += " (by " + summary.Sender + ")"
-	}
-	request := map[string]any{
-		"message":        message,
-		"name":           "GitHub",
-		"agentId":        b.cfg.OpenClawAgentID,
-		"sessionMode":    "isolated",
-		"idempotencyKey": summary.DeliveryID,
-		"event":          summary.Event,
-		"deliveryId":     summary.DeliveryID,
-		"repository":     summary.Repository,
-		"action":         summary.Action,
-		"sender":         summary.Sender,
-		"summary":        summary.Summary,
-		"payload":        summary.Payload,
-	}
-	return json.Marshal(request)
-}
-
-func (b *Bridge) forward(ctx context.Context, d delivery) error {
-	var summary githubSummary
-	if err := json.Unmarshal(d.Payload, &summary); err != nil {
-		return fmt.Errorf("decode queued summary: %w", err)
-	}
-	body, err := b.buildOpenClawPayload(summary)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.OpenClawURL, strings.NewReader(string(body)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+b.cfg.OpenClawToken)
-	req.Header.Set("Idempotency-Key", d.ID)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("OpenClaw returned HTTP %d", resp.StatusCode)
-	}
-	return nil
+	return outcome, nil
 }
 
 var errBodyTooLarge = errors.New("body too large")
@@ -730,6 +521,7 @@ func readLimitedBody(r io.Reader, max int64) ([]byte, error) {
 	}
 	return body, nil
 }
+
 func verifySignature(body []byte, header string, secret []byte) bool {
 	if !strings.HasPrefix(header, "sha256=") {
 		return false
@@ -740,17 +532,19 @@ func verifySignature(body []byte, header string, secret []byte) bool {
 	}
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(body)
-	expected := mac.Sum(nil)
-	return subtle.ConstantTimeCompare(received, expected) == 1
+	return subtle.ConstantTimeCompare(received, mac.Sum(nil)) == 1
 }
+
 func isJSONContentType(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(strings.Split(value, ";")[0]), "application/json")
 }
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
+
 func methodNotAllowed(w http.ResponseWriter) {
 	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 }
@@ -761,28 +555,34 @@ func main() {
 		slog.Error("configuration error", "error", err)
 		os.Exit(1)
 	}
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel})
-	logger := slog.New(handler)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	db, err := openDB(cfg.DBPath)
 	if err != nil {
 		logger.Error("database error", "error", err)
 		os.Exit(1)
 	}
 	defer db.Close()
-	bridge := &Bridge{cfg: cfg, db: db, client: &http.Client{}, log: logger}
-	server := &http.Server{Addr: cfg.ListenAddr, Handler: http.HandlerFunc(bridge.handler), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+
+	bridge := &Bridge{cfg: cfg, db: db, client: &http.Client{Timeout: cfg.ForwardTimeout}, log: logger}
+	server := &http.Server{
+		Addr: cfg.ListenAddr, Handler: http.HandlerFunc(bridge.handler),
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout, ReadTimeout: cfg.HTTPReadTimeout,
+		WriteTimeout: cfg.HTTPWriteTimeout, IdleTimeout: cfg.HTTPIdleTimeout,
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if !cfg.DryRun {
-		go bridge.worker(ctx)
-	}
+	go bridge.worker(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
-	logger.Info("github webhook bridge listening", "addr", cfg.ListenAddr, "openclaw_url", cfg.OpenClawURL, "dry_run", cfg.DryRun)
+
+	logger.Info("github webhook bridge listening", "version", bridgeVersion, "addr", cfg.ListenAddr,
+		"openclaw_url", cfg.OpenClawURL, "dry_run", cfg.DryRun,
+		"quiet_window", cfg.QuietWindow, "storm_window", cfg.StormWindow,
+		"quarantine_duration", cfg.QuarantineDuration)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
