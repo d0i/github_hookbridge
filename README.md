@@ -6,7 +6,7 @@ The bridge is intended to run locally on the VM. nginx exposes only the exact pu
 
 ## Status
 
-Implementation is in progress in Go according to the confirmed design choices at the end of this document.
+The Go bridge is deployed as a systemd service. For the configured repository, it accepts issue opened/closed/reopened/labeled/unlabeled events and issue-comment created events. Pull-request comments and other event actions are acknowledged but not forwarded.
 
 ## Why a bridge is needed
 
@@ -128,13 +128,13 @@ The GitHub webhook secret must be loaded from a protected secret file, never fro
 
 ## Policy enforcement
 
-The initial implementation should support explicit allowlists:
+The bridge enforces an exact repository allowlist from `GHB_ALLOWED_REPOSITORIES` and a built-in event/action allowlist:
 
-- `GITHUB_ALLOWED_REPOSITORIES`: exact `owner/name` values.
-- `GITHUB_ALLOWED_EVENTS`: exact event names.
-- `GITHUB_ALLOWED_ACTIONS`: optional per-event action allowlist.
+- `issues`: `opened`, `closed`, `reopened`, `labeled`, `unlabeled`
+- `issue_comment`: `created` for issues only (pull-request comments are ignored)
+- `pull_request`: `opened`, `closed`
 
-At minimum, the bridge must validate the payload's `repository.full_name` against the repository allowlist. Header values alone are not sufficient for authorization.
+The repository is validated from `repository.full_name` in the signed payload; the event header alone is not sufficient for authorization. Events/actions outside the allowlist are acknowledged with `202` and ignored, so selecting the broad Issues and Issue comments event categories in GitHub does not create failed deliveries for unrelated actions. GitHub's `ping` delivery is also acknowledged without starting an agent run.
 
 The bridge should support an optional sender allowlist only if there is a clear operational need. Repository and event policy are the primary controls.
 
@@ -179,7 +179,7 @@ The bridge should send a deliberately bounded message, for example:
 }
 ```
 
-The full GitHub payload should not be forwarded by default. If full payload forwarding is required, it must be explicitly enabled and remain subject to size limits and prompt-injection handling.
+The full GitHub payload is not forwarded. The bridge sends bounded issue metadata, the changed label name, and (for a new issue comment) up to 4,000 Unicode characters of comment text. The comment is explicitly marked as untrusted content; issue/comment text must never be treated as instructions.
 
 ## Reliability and duplicate handling
 

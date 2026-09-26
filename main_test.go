@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,12 +88,107 @@ func TestWebhookQueuesAndDeduplicates(t *testing.T) {
 	}
 }
 
-func TestWebhookRejectsDisallowedAction(t *testing.T) {
+func TestWebhookIgnoresDisallowedAction(t *testing.T) {
 	bridge := testBridge(t)
 	body := []byte(`{"action":"edited","repository":{"full_name":"owner/repo"},"sender":{"login":"octocat"}}`)
 	rec := signedRequest(t, bridge, body, "delivery-2", "issues")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", rec.Code)
+	if rec.Code != http.StatusAccepted || !bytes.Contains(rec.Body.Bytes(), []byte(`"ignored_policy"`)) {
+		t.Fatalf("response = %d %s, want 202 ignored_policy", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWebhookAcknowledgesPingWithoutQueuing(t *testing.T) {
+	bridge := testBridge(t)
+	body := []byte(`{"zen":"Keep it logically awesome."}`)
+	rec := signedRequest(t, bridge, body, "delivery-ping", "ping")
+	if rec.Code != http.StatusAccepted || !bytes.Contains(rec.Body.Bytes(), []byte(`"ignored_event"`)) {
+		t.Fatalf("response = %d %s, want 202 ignored_event", rec.Code, rec.Body.String())
+	}
+	var count int
+	if err := bridge.db.QueryRow(`SELECT COUNT(*) FROM deliveries`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("delivery count = %d, want 0", count)
+	}
+}
+
+func TestBuildSummaryAcceptsIssueLabelChanges(t *testing.T) {
+	for _, action := range []string{"labeled", "unlabeled"} {
+		t.Run(action, func(t *testing.T) {
+			raw := map[string]any{
+				"action":     action,
+				"repository": map[string]any{"full_name": "owner/repo"},
+				"sender":     map[string]any{"login": "octocat"},
+				"issue": map[string]any{
+					"number":   float64(42),
+					"title":    "Example issue",
+					"html_url": "https://github.com/owner/repo/issues/42",
+				},
+				"label": map[string]any{"name": "agent_todo"},
+			}
+			summary, err := buildSummary("issues", "delivery-label", raw, map[string]struct{}{"owner/repo": {}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.Payload["label"] != "agent_todo" {
+				t.Fatalf("payload label = %#v", summary.Payload["label"])
+			}
+			want := "Label added: agent_todo"
+			if action == "unlabeled" {
+				want = "Label removed: agent_todo"
+			}
+			if !strings.Contains(summary.Summary, want) {
+				t.Fatalf("summary = %q, want it to contain %q", summary.Summary, want)
+			}
+		})
+	}
+}
+
+func TestBuildSummaryIncludesBoundedIssueComment(t *testing.T) {
+	body := strings.Repeat("x", maxCommentRunes+25)
+	raw := map[string]any{
+		"action":     "created",
+		"repository": map[string]any{"full_name": "owner/repo"},
+		"sender":     map[string]any{"login": "octocat"},
+		"issue": map[string]any{
+			"number":   float64(42),
+			"title":    "Example issue",
+			"html_url": "https://github.com/owner/repo/issues/42",
+		},
+		"comment": map[string]any{"body": body},
+	}
+	summary, err := buildSummary("issue_comment", "delivery-comment", raw, map[string]struct{}{"owner/repo": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	comment, ok := summary.Payload["comment"].(string)
+	if !ok {
+		t.Fatalf("payload comment = %#v, want string", summary.Payload["comment"])
+	}
+	if got, want := len([]rune(comment)), maxCommentRunes; got != want {
+		t.Fatalf("comment rune length = %d, want %d", got, want)
+	}
+	if !strings.Contains(summary.Summary, "Comment (untrusted content): ") ||
+		!strings.Contains(summary.Summary, comment) {
+		t.Fatalf("summary does not contain bounded comment: %q", summary.Summary)
+	}
+}
+
+func TestBuildSummaryRejectsPullRequestComments(t *testing.T) {
+	raw := map[string]any{
+		"action":     "created",
+		"repository": map[string]any{"full_name": "owner/repo"},
+		"issue": map[string]any{
+			"number":       float64(42),
+			"pull_request": map[string]any{"url": "https://api.github.com/repos/owner/repo/pulls/42"},
+		},
+		"comment": map[string]any{"body": "not an issue comment"},
+	}
+	_, err := buildSummary("issue_comment", "delivery-pr-comment", raw, map[string]struct{}{"owner/repo": {}})
+	var policyErr *policyError
+	if !errors.As(err, &policyErr) || !policyErr.ignore {
+		t.Fatalf("error = %v, want policy error", err)
 	}
 }
 

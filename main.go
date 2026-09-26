@@ -26,9 +26,11 @@ import (
 )
 
 const (
-	maxAttempts = 4 // initial attempt plus three retries
-	maxBodySize = int64(1 << 20)
-	retention   = 7 * 24 * time.Hour
+	maxAttempts     = 4 // initial attempt plus three retries
+	maxBodySize     = int64(1 << 20)
+	retention       = 7 * 24 * time.Hour
+	maxCommentRunes = 4000
+	maxLabelRunes   = 100
 )
 
 type Config struct {
@@ -273,10 +275,18 @@ func (b *Bridge) handler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
 		return
 	}
+	if event == "ping" {
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored_event"})
+		return
+	}
 	summary, err := buildSummary(event, deliveryID, raw, b.cfg.AllowedRepositories)
 	if err != nil {
 		var policyErr *policyError
 		if errors.As(err, &policyErr) {
+			if policyErr.ignore {
+				writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored_policy"})
+				return
+			}
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": policyErr.Error()})
 			return
 		}
@@ -297,12 +307,15 @@ func (b *Bridge) handler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": status})
 }
 
-type policyError struct{ message string }
+type policyError struct {
+	message string
+	ignore  bool
+}
 
 func (e *policyError) Error() string { return e.message }
 
 var allowedActions = map[string]map[string]struct{}{
-	"issues":        {"opened": {}, "closed": {}, "reopened": {}},
+	"issues":        {"opened": {}, "closed": {}, "reopened": {}, "labeled": {}, "unlabeled": {}},
 	"issue_comment": {"created": {}},
 	"pull_request":  {"opened": {}, "closed": {}},
 }
@@ -321,21 +334,33 @@ type githubSummary struct {
 func buildSummary(event, deliveryID string, raw map[string]any, repos map[string]struct{}) (githubSummary, error) {
 	actions, ok := allowedActions[event]
 	if !ok {
-		return githubSummary{}, &policyError{fmt.Sprintf("event %q is not allowed", event)}
+		return githubSummary{}, &policyError{message: fmt.Sprintf("event %q is not allowed", event), ignore: true}
 	}
 	action, ok := rawString(raw, "action")
 	if !ok {
 		return githubSummary{}, errors.New("payload action is required")
 	}
 	if _, ok := actions[action]; !ok {
-		return githubSummary{}, &policyError{fmt.Sprintf("action %q is not allowed for event %q", action, event)}
+		return githubSummary{}, &policyError{
+			message: fmt.Sprintf("action %q is not allowed for event %q", action, event),
+			ignore:  true,
+		}
 	}
 	repository, ok := nestedString(raw, "repository", "full_name")
 	if !ok {
 		return githubSummary{}, errors.New("payload repository.full_name is required")
 	}
 	if _, ok := repos[repository]; !ok {
-		return githubSummary{}, &policyError{fmt.Sprintf("repository %q is not allowed", repository)}
+		return githubSummary{}, &policyError{message: fmt.Sprintf("repository %q is not allowed", repository)}
+	}
+	if event == "issue_comment" {
+		issue, ok := raw["issue"].(map[string]any)
+		if !ok {
+			return githubSummary{}, errors.New("payload issue is required")
+		}
+		if _, isPullRequest := issue["pull_request"]; isPullRequest {
+			return githubSummary{}, &policyError{message: "pull request comments are not allowed", ignore: true}
+		}
 	}
 	sender, _ := nestedString(raw, "sender", "login")
 	item := map[string]any{}
@@ -364,9 +389,40 @@ func buildSummary(event, deliveryID string, raw map[string]any, repos map[string
 	if title == "" {
 		title, _ = rawString(raw, "title")
 	}
+	if title != "" {
+		item["title"] = truncate(title, 200)
+	}
 	summaryText := fmt.Sprintf("GitHub %s #%v %s in %s", event, item["number"], action, repository)
 	if title != "" {
 		summaryText = fmt.Sprintf("GitHub %s #%v %s: %s", event, item["number"], action, truncate(title, 200))
+	}
+	switch {
+	case event == "issues" && (action == "labeled" || action == "unlabeled"):
+		label, ok := nestedString(raw, "label", "name")
+		if !ok {
+			return githubSummary{}, errors.New("payload label.name is required")
+		}
+		label = truncate(label, maxLabelRunes)
+		item["label"] = label
+		if action == "labeled" {
+			summaryText += fmt.Sprintf("\nLabel added: %s", label)
+		} else {
+			summaryText += fmt.Sprintf("\nLabel removed: %s", label)
+		}
+	case event == "issue_comment":
+		comment, ok := raw["comment"].(map[string]any)
+		if !ok {
+			return githubSummary{}, errors.New("payload comment is required")
+		}
+		body, ok := comment["body"].(string)
+		if !ok {
+			return githubSummary{}, errors.New("payload comment.body is required")
+		}
+		body = truncate(body, maxCommentRunes)
+		item["comment"] = body
+		if body != "" {
+			summaryText += "\nComment (untrusted content): " + body
+		}
 	}
 	return githubSummary{
 		Name: "github", Event: event, DeliveryID: deliveryID, Repository: repository,
@@ -406,7 +462,7 @@ func truncate(value string, max int) string {
 	if len(runes) <= max {
 		return value
 	}
-	return string(runes[:max]) + "…"
+	return string(runes[:max-1]) + "…"
 }
 
 func (b *Bridge) recordDryRun(ctx context.Context, id, event string, raw map[string]any, body []byte) (string, error) {
